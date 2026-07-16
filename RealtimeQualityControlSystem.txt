@@ -1,0 +1,203 @@
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+from threading import Thread, Lock
+
+# --- SETTINGS ---
+TARGET_L, TARGET_W, TARGET_H = 60, 18.0, 17.5
+TOLERANCE = 5.0  
+
+PPM_SIDE, PPM_FRONT = 5.70, 11.40
+BUZZER_PIN = 17
+MAX_SAMPLES = 20
+
+# relaxed valid ranges (important)
+VALID_L_RANGE = (30, 90)
+VALID_W_RANGE = (8, 35)
+VALID_H_RANGE = (8, 35)
+
+# --- VIDEO STREAM ---
+class VideoStream:
+    def __init__(self, index):
+        self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+
+        # resolution reduced
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 240)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 180)
+
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_FPS, 10)
+
+        # reduce motion blur
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+
+        self.ret, self.frame = self.cap.read()
+        self.lock = Lock()
+        self.running = True
+
+    def start(self):
+        Thread(target=self.update, daemon=True).start()
+        return self
+
+    def update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.frame = frame
+                    self.ret = ret
+
+    def read(self):
+        with self.lock:
+            return self.frame.copy() if self.ret else None
+
+    def stop(self):
+        self.running = False
+        self.cap.release()
+
+# --- METRICS ---
+def get_metrics(frame, ppm):
+    if frame is None or frame.size == 0:
+        return 0, 0, 0
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+
+    thresh = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        11, 2
+    )
+
+    kernel = np.ones((3,3), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not cnts:
+        return 0, 0, 0
+
+    c = max(cnts, key=cv2.contourArea)
+
+    if cv2.contourArea(c) < 1500:
+        return 0, 0, 0
+
+    rect = cv2.minAreaRect(c)
+    (x, y), (w, h), _ = rect
+
+    real1 = w / ppm
+    real2 = h / ppm
+
+    return max(real1, real2), min(real1, real2), x
+
+# --- HARDWARE ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+
+def trigger_buzzer(passed):
+    def run():
+        if passed:
+            GPIO.output(BUZZER_PIN, 1)
+            time.sleep(0.2)
+            GPIO.output(BUZZER_PIN, 0)
+        else:
+            for _ in range(3):
+                GPIO.output(BUZZER_PIN, 1)
+                time.sleep(0.05)
+                GPIO.output(BUZZER_PIN, 0)
+                time.sleep(0.05)
+    Thread(target=run, daemon=True).start()
+
+# --- MAIN ---
+cam_s = VideoStream(0).start()
+cam_f = VideoStream(2).start()
+
+is_scanning = False
+log_l, log_w, log_h = [], [], []
+last_seen_time = time.time()
+
+print(">> SYSTEM READY (STABLE MODE)")
+
+try:
+    while True:
+        fs = cam_s.read()
+        ff = cam_f.read()
+
+        if fs is None or ff is None:
+            continue
+
+        l, h_s, _ = get_metrics(fs, PPM_SIDE)
+        w, h_f, _ = get_metrics(ff, PPM_FRONT)
+
+        h_avg = (h_s + h_f) / 2
+
+        # --- OBJECT DETECTED ---
+        if l > 12 and w > 12:
+            is_scanning = True
+            last_seen_time = time.time()
+
+            if (VALID_L_RANGE[0] < l < VALID_L_RANGE[1] and
+                VALID_W_RANGE[0] < w < VALID_W_RANGE[1] and
+                VALID_H_RANGE[0] < h_avg < VALID_H_RANGE[1]):
+
+                log_l.append(l)
+                log_w.append(w)
+                log_h.append(h_avg)
+
+                if len(log_l) > MAX_SAMPLES:
+                    log_l.pop(0)
+                    log_w.pop(0)
+                    log_h.pop(0)
+
+        # --- OBJECT LEFT ---
+        elif is_scanning and ((l < 10 or w < 10) or (time.time() - last_seen_time > 0.2)):
+
+            if len(log_l) < 3:
+                print("REJECTED: Not enough valid samples")
+                is_scanning = False
+                log_l, log_w, log_h = [], [], []
+                continue
+
+            # --- SMART FINAL VALUE ---
+            if len(log_l) < 6:
+                final_l = np.mean(log_l)
+                final_w = np.mean(log_w)
+                final_h = np.mean(log_h)
+            else:
+                final_l = np.percentile(log_l, 75)
+                final_w = np.percentile(log_w, 75)
+                final_h = np.percentile(log_h, 75)
+
+            pass_l = abs(final_l - TARGET_L) <= TOLERANCE
+            pass_w = abs(final_w - TARGET_W) <= TOLERANCE
+            pass_h = abs(final_h - TARGET_H) <= TOLERANCE
+
+            passed = pass_l and pass_w and pass_h
+
+            trigger_buzzer(passed)
+
+            print("\n-------------------")
+            print(f"Length : {final_l:.2f} ({'OK' if pass_l else 'BAD'})")
+            print(f"Width  : {final_w:.2f} ({'OK' if pass_w else 'BAD'})")
+            print(f"Height : {final_h:.2f} ({'OK' if pass_h else 'BAD'})")
+            print(f"FINAL RESULT: {'PASS' if passed else 'FAIL'}")
+            print("-------------------\n")
+
+            is_scanning = False
+            log_l, log_w, log_h = [], [], []
+
+        # balanced FPS
+        time.sleep(0.08)
+
+except KeyboardInterrupt:
+    print("Stopping...")
+
+finally:
+    cam_s.stop()
+    cam_f.stop()
+    GPIO.cleanup()
